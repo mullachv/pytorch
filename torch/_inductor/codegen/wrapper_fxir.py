@@ -15,9 +15,11 @@ from torch._higher_order_ops.triton_kernel_wrap import (
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 from torch._inductor.select_algorithm import extern_kernels  # noqa: F401
+from torch._inductor.utils import sympy_product
 from torch._inductor.virtualized import V
 from torch._library.triton import wrap_triton
 from torch.fx import GraphModule
+from torch.utils._sympy.functions import FloorDiv
 
 from .. import ir
 from ..utils import convert_shape_to_symint, convert_to_symint, LineContext
@@ -192,6 +194,23 @@ class FxConverter:
         node.name = name
         node.meta["val"] = buffer.get_example()
 
+    def _create_as_strided(
+        self,
+        input_node: torch.fx.Node,
+        size: tuple[Any, ...],
+        stride: tuple[Any, ...],
+        offset: Union[int, sympy.Expr],
+    ) -> torch.fx.Node:
+        return self.gm.graph.call_function(
+            torch.as_strided,
+            args=(
+                input_node,
+                convert_shape_to_symint(size),
+                convert_shape_to_symint(stride),
+                convert_to_symint(offset),
+            ),
+        )
+
     def _record_allocation(self, buffer: CodegenBuffer, node: torch.fx.Node) -> None:
         """
         Updates the symbol table to record that an Inductor buffer maps to the result of
@@ -237,8 +256,13 @@ class FxConverter:
         """
         Converts graph inputs to FX placeholders.
         """
-        for ir_node in V.graph.graph_inputs.values():
-            buffer = self._get_buffer(ir_node)
+        for name, ir_node in V.graph.graph_inputs.items():
+            # Introduce a new symbol for constant inputs.
+            buffer = (
+                SymbolBuffer(sympy.Symbol(name, is_integer=True))
+                if isinstance(ir_node, (int, float, sympy.Integer, sympy.Float))
+                else self._get_buffer(ir_node)
+            )
             node = self.gm.graph.placeholder(buffer.get_name())
             self._create_meta_from_buffer(node, buffer)
             self._record_allocation(buffer, node)
@@ -404,12 +428,17 @@ class FxConverter:
         assert name
         size = tuple(layout.size)
         stride = tuple(layout.stride)
+        if isinstance(layout, ir.NonOwningLayout):
+            # Look up the view's layout.
+            view = layout.view
+            assert isinstance(view, ir.ReinterpretView), (
+                f"unexpected type: {type(view)}"
+            )
+            layout = view.layout
         offset = input_buffer.get_offset() + layout.offset
 
         # Map ReinterpretView to as_strided.
-        result_node = self.gm.graph.call_function(
-            torch.as_strided, args=(input_node, size, stride, offset)
-        )
+        result_node = self._create_as_strided(input_node, size, stride, offset)
         result_node.name = name
         result_node.meta["val"] = layout.get_example()
         self._record_allocation(result_buffer, result_node)
@@ -425,17 +454,15 @@ class FxConverter:
         result_node = old_node
 
         # Change shape and stride.
-        size = new.get_size()
-        stride = new.get_stride()
+        size = tuple(new.get_size())
+        stride = tuple(new.get_stride())
         offset = new.get_offset()
         if (
-            old.get_size() != size
-            or old.get_stride() != stride
+            tuple(old.get_size()) != size
+            or tuple(old.get_stride()) != stride
             or old.get_offset() != offset
         ):
-            result_node = self.gm.graph.call_function(
-                torch.as_strided, args=(old_node, size, stride, offset)
-            )
+            result_node = self._create_as_strided(old_node, size, stride, offset)
             self._create_meta_from_buffer(result_node, new)
 
         self._record_allocation(new, result_node)
@@ -486,10 +513,39 @@ class FxConverter:
         call_kwargs = dict(zip(tuner.triton_meta["signature"], call_args))
         call_kwargs.update(config.kwargs)
 
+        def replace_floor_div(expr: sympy.Expr) -> sympy.Expr:
+            """
+            Converts floor(x / c) to x // c.
+            """
+            if isinstance(expr, sympy.core.mul.Mul) and isinstance(
+                expr.args[0], sympy.Rational
+            ):
+                # Only the first argument of a Mul can be a Rational.
+                frac = expr.args[0]
+                numerator = sympy_product(expr.args[1:]) * frac.numerator
+                denominator = frac.denominator
+
+                # Sanity check the results.
+                new_expr = numerator / denominator
+                assert V.graph.sizevars.statically_known_equals(new_expr, expr), (
+                    f"Unsound replacement: '{new_expr}' != '{expr}'"
+                )
+
+                return FloorDiv(numerator, denominator)
+            else:
+                return sympy.floor(expr)
+
+        def expr_to_symint(expr: Union[int, sympy.Expr]) -> Union[int, sympy.Expr]:
+            return (
+                convert_to_symint(expr.replace(sympy.floor, replace_floor_div))
+                if isinstance(expr, sympy.Expr)
+                else expr
+            )
+
         # Convert sympy expressions to symints.
-        for name, val in call_kwargs.items():
-            if isinstance(val, sympy.Expr):
-                call_kwargs[name] = convert_to_symint(val)
+        # Use FloorDiv over sympy.floor, so we can get nicer Python code from FX.
+        wrapper_grid = [tuple(expr_to_symint(dim) for dim in grid)]
+        call_kwargs = {name: expr_to_symint(val) for name, val in call_kwargs.items()}
 
         # Store non-graphable kwargs in the side table.
         (
@@ -502,7 +558,7 @@ class FxConverter:
             kwargs={
                 "kernel_idx": kernel.wrapped.kernel_idx,
                 "constant_args_idx": constant_args_idx,
-                "grid": [convert_shape_to_symint(grid)],
+                "grid": wrapper_grid,
                 "tma_descriptor_metadata": {},
                 "kwargs": call_kwargs,
             },
