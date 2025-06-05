@@ -110,7 +110,7 @@ def traverse(datapipe: DataPipe, only_datapipe: Optional[bool] = None) -> DataPi
     Traverse the DataPipes and their attributes to extract the DataPipe graph.
 
     [Deprecated]
-    When ``only_dataPipe`` is specified as ``True``, it would only look into the
+    When ``only_datapipe`` is specified as ``True``, it would only look into the
     attribute from each DataPipe that is either a DataPipe and a Python collection object
     such as ``list``, ``tuple``, ``set`` and ``dict``.
 
